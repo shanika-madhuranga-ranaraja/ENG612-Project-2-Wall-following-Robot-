@@ -7,7 +7,6 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
 
 
 class WallFollowingPID(Node):
@@ -15,143 +14,113 @@ class WallFollowingPID(Node):
     def __init__(self):
         super().__init__('wall_following_pid')
 
-        # -----------------------------------
-        # WALL FOLLOWING SETTINGS
-        # -----------------------------------
+        # Desired LEFT-wall distance
         self.desired_distance = 0.30
 
-        # Initial PID gains
-        self.kp = 0.9
+        # Single PID controller
+        self.kp = 0.8
         self.ki = 0.0
-        self.kd = 0.015
+        self.kd = 0.02
 
-        # Slow initial test speed
+        # Constant forward speed during wall following
         self.linear_speed = 0.05
-        self.max_angular_speed = 0.35
+        self.max_angular_speed = 0.25
 
-        # Corner detection distance
-        self.front_limit = 0.40
+        # Corner detection and turning
+        self.corner_distance = 0.40
+        self.front_clear_distance = 0.75
+        self.turn_speed = 0.25
 
-        # 90-degree clockwise turn
-        self.target_turn = math.pi / 2
-        self.turn_speed = 0.35
-        self.turn_tolerance = math.radians(3)
+        # Detect next wall after turning
+        self.next_wall_min = 0.20
+        self.next_wall_max = 0.55
+
+        # Turning safety
+        self.minimum_turn_time = 1.0
+        self.maximum_turn_time = 15.0
+        self.required_clear_count = 5
 
         # PID variables
         self.integral = 0.0
-        self.previous_error = 0.0
+        self.previous_error = None
         self.previous_time = None
 
-        # Robot state
-        self.state = 'FOLLOW_WALL'
-
-        # Odometry variables
-        self.current_yaw = None
-        self.previous_yaw = None
-        self.turned_angle = 0.0
-
-        # Timing and safety
+        # LiDAR measurements
+        self.left_distance = None
+        self.front_distance = None
         self.last_scan_time = None
+
+        # Controller states
+        self.state = 'FOLLOW_WALL'
+        self.corner_start_time = None
+        self.clear_count = 0
+        self.corner_count = 0
+
         self.last_log_time = 0.0
 
-        # Publisher
+        # ROS publisher
         self.publisher = self.create_publisher(
             Twist,
             '/cmd_vel',
             10
         )
 
-        # LiDAR subscriber
-        self.scan_subscription = self.create_subscription(
+        # ROS subscriber
+        self.subscription = self.create_subscription(
             LaserScan,
             '/scan',
             self.scan_callback,
             10
         )
 
-        # Odometry subscriber
-        self.odom_subscription = self.create_subscription(
-            Odometry,
-            '/odom',
-            self.odom_callback,
-            10
-        )
-
-        # Control timer
+        # Control loop: 10 Hz
         self.timer = self.create_timer(
             0.1,
             self.control_loop
         )
 
         self.get_logger().info(
-            'LEFT Wall Following PID Started'
+            'LEFT WALL FOLLOWING STARTED'
         )
         self.get_logger().info(
-            'Target distance: 0.30 m'
+            'Single PID Controller'
         )
         self.get_logger().info(
-            'Corner turning: 90 degrees RIGHT'
+            'Target: 0.30 m | Linear speed: 0.05 m/s'
         )
 
-    # -----------------------------------
-    # ANGLE NORMALIZATION
-    # -----------------------------------
-    def normalize_angle(self, angle):
-        return math.atan2(
-            math.sin(angle),
-            math.cos(angle)
-        )
-
-    # -----------------------------------
-    # ODOMETRY CALLBACK
-    # -----------------------------------
-    def odom_callback(self, msg):
-
-        q = msg.pose.pose.orientation
-
-        siny = 2.0 * (
-            q.w * q.z + q.x * q.y
-        )
-
-        cosy = 1.0 - 2.0 * (
-            q.y * q.y + q.z * q.z
-        )
-
-        yaw = math.atan2(siny, cosy)
-
-        # Accumulate actual rotation during a turn
-        if (
-            self.state == 'TURNING'
-            and self.previous_yaw is not None
-        ):
-            delta = self.normalize_angle(
-                yaw - self.previous_yaw
-            )
-
-            self.turned_angle += delta
-
-        self.current_yaw = yaw
-        self.previous_yaw = yaw
-
-    # -----------------------------------
+    # ----------------------------------
     # READ LIDAR SECTOR
-    # -----------------------------------
-    def get_sector_distance(
-        self, msg, angle_deg, width_deg,
-        use_min=False
+    # ----------------------------------
+    def get_distance(
+        self, msg, angle_deg,
+        width_deg=5, use_min=False
     ):
 
-        values = []
+        readings = []
 
-        start = angle_deg - width_deg
-        end = angle_deg + width_deg
+        if msg.angle_increment <= 0:
+            return None
+
+        scan_span = msg.angle_max - msg.angle_min
+
+        full_circle = (
+            scan_span >= 2 * math.pi
+            - 2 * msg.angle_increment
+        )
 
         for degree in range(
-            int(start),
-            int(end) + 1
+            angle_deg - width_deg,
+            angle_deg + width_deg + 1
         ):
 
             angle = math.radians(degree)
+
+            if full_circle:
+                angle = (
+                    (angle - msg.angle_min)
+                    % (2.0 * math.pi)
+                ) + msg.angle_min
 
             index = round(
                 (angle - msg.angle_min)
@@ -167,88 +136,89 @@ class WallFollowingPID(Node):
                     and msg.range_min <= distance
                     <= msg.range_max
                 ):
-                    values.append(distance)
+                    readings.append(distance)
 
-        if not values:
+        if not readings:
             return None
 
         if use_min:
-            return min(values)
+            return min(readings)
 
-        return statistics.median(values)
+        return statistics.median(readings)
 
-    # -----------------------------------
+    # ----------------------------------
     # LIDAR CALLBACK
-    # -----------------------------------
+    # ----------------------------------
     def scan_callback(self, msg):
 
-        self.left_distance = self.get_sector_distance(
+        # LEFT (+90 degrees)
+        self.left_distance = self.get_distance(
             msg, 90, 5
         )
 
-        self.front_distance = self.get_sector_distance(
-            msg, 0, 15, use_min=True
+        # FRONT (0 degrees)
+        self.front_distance = self.get_distance(
+            msg, 0, 12, use_min=True
         )
 
         self.last_scan_time = time.monotonic()
 
-    # -----------------------------------
-    # START CORNER TURN
-    # -----------------------------------
-    def start_turn(self):
-
-        self.state = 'TURNING'
-
-        self.turned_angle = 0.0
-
-        self.previous_yaw = self.current_yaw
+    # ----------------------------------
+    # RESET PID
+    # ----------------------------------
+    def reset_pid(self):
 
         self.integral = 0.0
+        self.previous_error = None
         self.previous_time = None
 
-        # Stop before rotating
+    # ----------------------------------
+    # START CORNER
+    # ----------------------------------
+    def start_corner(self, now):
+
+        self.state = 'TURN_RIGHT'
+        self.corner_start_time = now
+        self.clear_count = 0
+
+        self.reset_pid()
+
         self.publisher.publish(Twist())
 
         self.get_logger().info(
-            'CORNER DETECTED - Turning RIGHT 90 degrees'
+            'CORNER DETECTED - TURN RIGHT'
         )
 
-    # -----------------------------------
+    # ----------------------------------
     # MAIN CONTROL LOOP
-    # -----------------------------------
+    # ----------------------------------
     def control_loop(self):
 
-        command = Twist()
         now = time.monotonic()
+        command = Twist()
 
-        # Stop if sensor information is missing
+        # Stop if scan is unavailable or outdated
         if (
             self.last_scan_time is None
             or now - self.last_scan_time > 1.0
-            or self.current_yaw is None
+            or self.front_distance is None
+            or self.left_distance is None
         ):
             self.publisher.publish(command)
             return
 
-        # -----------------------------------
+        front = self.front_distance
+        left = self.left_distance
+
+        # ----------------------------------
         # STATE 1: FOLLOW WALL
-        # -----------------------------------
+        # ----------------------------------
         if self.state == 'FOLLOW_WALL':
 
-            front = self.front_distance
-            left = self.left_distance
-
-            # Invalid readings: stop safely
-            if front is None or left is None:
-                self.publisher.publish(command)
+            if front <= self.corner_distance:
+                self.start_corner(now)
                 return
 
-            # Detect corner
-            if front < self.front_limit:
-                self.start_turn()
-                return
-
-            # Time difference
             if self.previous_time is None:
                 dt = 0.0
             else:
@@ -259,7 +229,6 @@ class WallFollowingPID(Node):
             # Distance error
             error = self.desired_distance - left
 
-            # Integral and derivative
             derivative = 0.0
 
             if dt > 0:
@@ -270,23 +239,21 @@ class WallFollowingPID(Node):
                     min(0.3, self.integral)
                 )
 
-                derivative = (
-                    error - self.previous_error
-                ) / dt
+                if self.previous_error is not None:
+                    derivative = (
+                        error - self.previous_error
+                    ) / dt
 
             self.previous_error = error
 
-            # PID output
-            pid = (
+            # Single PID for angular velocity
+            pid_output = (
                 self.kp * error
                 + self.ki * self.integral
                 + self.kd * derivative
             )
 
-            # LEFT wall following:
-            # Too close -> turn RIGHT
-            # Too far -> turn LEFT
-            angular = -pid
+            angular = -pid_output
 
             angular = max(
                 -self.max_angular_speed,
@@ -305,53 +272,101 @@ class WallFollowingPID(Node):
                     f'Left: {left:.3f} m | '
                     f'Front: {front:.3f} m | '
                     f'Error: {error:+.3f} m | '
+                    f'Linear: {command.linear.x:.3f} | '
                     f'Angular: {angular:+.3f}'
                 )
 
                 self.last_log_time = now
 
-        # -----------------------------------
-        # STATE 2: TURN RIGHT 90 DEGREES
-        # -----------------------------------
-        elif self.state == 'TURNING':
+        # ----------------------------------
+        # STATE 2: TURN RIGHT
+        # ----------------------------------
+        elif self.state == 'TURN_RIGHT':
 
-            rotation = abs(self.turned_angle)
+            elapsed = now - self.corner_start_time
 
-            if rotation < (
-                self.target_turn - self.turn_tolerance
-            ):
+            # Timeout safety
+            if elapsed >= self.maximum_turn_time:
 
-                # Rotate clockwise in place
-                command.linear.x = 0.0
-                command.angular.z = -self.turn_speed
-
-                self.publisher.publish(command)
-
-            else:
-
-                # Stop rotating
+                self.state = 'STOPPED'
                 self.publisher.publish(Twist())
 
-                self.get_logger().info(
-                    '90 DEGREE TURN COMPLETED'
+                self.get_logger().warning(
+                    'TURN TIMEOUT - ROBOT STOPPED'
                 )
+                return
 
+            # Front must be clear
+            front_clear = (
+                front >= self.front_clear_distance
+            )
+
+            # Left wall must be detected
+            left_wall_detected = (
+                self.next_wall_min
+                <= left
+                <= self.next_wall_max
+            )
+
+            ready = (
+                elapsed >= self.minimum_turn_time
+                and front_clear
+                and left_wall_detected
+            )
+
+            if ready:
+                self.clear_count += 1
+            else:
+                self.clear_count = 0
+
+            if self.clear_count >= self.required_clear_count:
+
+                self.publisher.publish(Twist())
+
+                self.corner_count += 1
                 self.state = 'FOLLOW_WALL'
 
-                # Reset PID for next wall
-                self.integral = 0.0
-                self.previous_error = 0.0
-                self.previous_time = None
+                self.reset_pid()
 
                 self.get_logger().info(
-                    'Following NEXT LEFT wall'
+                    f'CORNER {self.corner_count} COMPLETED'
                 )
 
-    # -----------------------------------
+                self.get_logger().info(
+                    f'Next Left Wall: {left:.3f} m'
+                )
+                return
+
+            # Rotate right without fixed angle
+            command.linear.x = 0.0
+            command.angular.z = -self.turn_speed
+
+            self.publisher.publish(command)
+
+            if now - self.last_log_time >= 1.0:
+
+                self.get_logger().info(
+                    f'TURN RIGHT | '
+                    f'Front: {front:.3f} m | '
+                    f'Left: {left:.3f} m | '
+                    f'Time: {elapsed:.1f} s'
+                )
+
+                self.last_log_time = now
+
+        # ----------------------------------
+        # STATE 3: STOPPED
+        # ----------------------------------
+        else:
+            self.publisher.publish(Twist())
+
+    # ----------------------------------
     # STOP ROBOT
-    # -----------------------------------
+    # ----------------------------------
     def stop_robot(self):
-        self.publisher.publish(Twist())
+
+        if rclpy.ok():
+            self.publisher.publish(Twist())
 
 
 def main(args=None):
@@ -376,5 +391,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
 
