@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+         'lidar_subscriber = wall_following.lidar_subscriber:main',
         ],
     },
 )
