@@ -1,0 +1,32 @@
+wall_follower:
+  ros__parameters:
+    target_distance: 0.3
+    base_speed: 0.09
+    min_speed: 0.015
+    max_angular: 0.5
+    lookahead: 0.12
+    angular_kp: 2.0
+    angular_ki: 0.02
+    angular_kd: 0.50
+    linear_kp: 0.10
+    linear_ki: 0.008
+    linear_kd: 0.02
+    front_turn: 0.35
+    front_release: 0.58
+    emergency_distance: 0.15
+    turn_speed: 0.35
+    slowdown_distance: 0.8
+    speed_error_tolerance: 0.02
+    wall_lost_distance: 1.0
+    scan_yaw_offset: 0.0
+    scan_topic: /scan
+    cmd_vel_topic: /cmd_vel
+    scan_timeout: 0.75
+    stamped_cmd_vel: false
+    enabled: false
+    turn_angle_deg: 90.0
+    turn_tolerance_deg: 2.0
+    turn_min_speed: 0.08
+    turn_heading_kp: 1.5
+    #turn_timeout: 12.0
+    corner_rearm_distance: 0.12
